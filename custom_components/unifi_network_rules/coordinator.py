@@ -8,10 +8,9 @@ import time
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 
 from aiounifi.models.traffic_route import TrafficRoute
@@ -22,14 +21,18 @@ from aiounifi.models.firewall_zone import FirewallZone
 from aiounifi.models.wlan import Wlan
 from aiounifi.models.device import Device
 
-from .const import DOMAIN, LOGGER, CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL, DEBUG_WEBSOCKET
+from .const import DOMAIN, LOGGER, DEFAULT_UPDATE_INTERVAL, LOG_TRIGGERS
 from .udm import UDMAPI
-from .websocket import SIGNAL_WEBSOCKET_MESSAGE, UnifiRuleWebsocket
-from .helpers.rule import get_rule_id, get_rule_name, get_rule_enabled, get_child_unique_id
-from .utils.logger import log_data, log_websocket
+from .helpers.rule import get_rule_id, get_child_unique_id
+from .utils.logger import log_data
 from .models.firewall_rule import FirewallRule
 from .models.qos_rule import QoSRule
 from .models.vpn_config import VPNConfig
+from .models.port_profile import PortProfile
+from .models.network import NetworkConf
+from .models.static_route import StaticRoute
+from .smart_polling import SmartPollingManager, SmartPollingConfig
+from .unified_change_detector import UnifiedChangeDetector
 
 # This is a fallback if no update_interval is specified
 SCAN_INTERVAL = timedelta(seconds=60)
@@ -44,9 +47,9 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         self, 
         hass: HomeAssistant, 
         api: UDMAPI, 
-        websocket: UnifiRuleWebsocket,
         update_interval: int = DEFAULT_UPDATE_INTERVAL,
         platforms: Optional[List[Platform]] = None,
+        smart_polling_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Initialize the coordinator with API and update interval."""
         super().__init__(
@@ -56,12 +59,25 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=update_interval),
         )
 
-        # Keep a reference to the API and websocket
+        # Keep a reference to the API
         self.api = api
-        self.websocket = websocket
         
         # Initialize config_entry to None - it will be looked up when needed
         self.config_entry = None
+        
+        # Initialize Smart Polling Manager
+        polling_config = SmartPollingConfig(
+            base_interval=smart_polling_config.get('base_interval', 300) if smart_polling_config else 300,
+            active_interval=smart_polling_config.get('active_interval', 30) if smart_polling_config else 30,
+            realtime_interval=smart_polling_config.get('realtime_interval', 10) if smart_polling_config else 10,
+            activity_timeout=smart_polling_config.get('activity_timeout', 120) if smart_polling_config else 120,
+            debounce_seconds=smart_polling_config.get('debounce_seconds', 10) if smart_polling_config else 10,
+            optimistic_timeout=smart_polling_config.get('optimistic_timeout', 15) if smart_polling_config else 15,
+        )
+        self.smart_polling = SmartPollingManager(self, polling_config)
+        
+        # Initialize Unified Change Detector
+        self.change_detector = UnifiedChangeDetector(hass, self)
         
         # Update lock - prevent simultaneous updates
         self._update_lock = asyncio.Lock()
@@ -89,13 +105,12 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         # to prevent the trigger from causing a redundant refresh and to prevent a potential race condition
         self._ha_initiated_operations: Dict[str, float] = {}
         
-        # Websocket processing is now handled by trigger system
+        # Change detection is now handled by unified change detector
         
         # Track entities we added or removed
         # By unique ID rather than the objects themselves
         self.known_unique_ids: Set[str] = set()
         self.removed_unique_ids: Set[str] = set()
-        self._entity_creation_queue = []
         
         # Rule collections - these are maintained by the coordinator
         # To be used by services for operations like enable/disable rules
@@ -103,6 +118,7 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         self.traffic_routes: List[TrafficRoute] = []
         self.firewall_policies: List[FirewallPolicy] = []
         self.traffic_rules: List[TrafficRule] = []
+        self.static_routes: List[StaticRoute] = []
         self.legacy_firewall_rules: List[FirewallRule] = []
         self.firewall_zones: List[FirewallZone] = []
         self.wlans: List[Wlan] = []
@@ -110,10 +126,16 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         self.vpn_clients: List[VPNConfig] = []
         self.vpn_servers: List[VPNConfig] = []
         self.devices: List[Device] = []  # For LED toggle switches
+        self.port_profiles: List[PortProfile] = []
+        self.networks: List[NetworkConf] = []
 
         # For dynamic entity creation
         self.async_add_entities_callback: AddEntitiesCallback | None = None
         self.entity_platform = None  # Store the entity platform for later use
+        
+        # Coordination and cleanup
+        self._refresh_semaphore = asyncio.Semaphore(1)  # Limit concurrent refreshes
+        self._cleanup_callbacks = []  # Store cleanup callbacks
 
         # Save platforms to load
         self._platforms = platforms or [Platform.SWITCH]
@@ -128,21 +150,28 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         self._consecutive_errors = 0
         self._api_errors = 0
 
-    def register_ha_initiated_operation(self, rule_id: str, timeout: int = 15) -> None:
+    def register_ha_initiated_operation(self, rule_id: str, entity_id: str, change_type: str = "modified", timeout: int = 15) -> None:
         """Register that a rule change was initiated from HA.
         
         This is called by a switch entity just before it queues an API call.
-        The trigger system will check this to avoid a redundant refresh.
+        The smart polling system will use this for debounced refresh.
         
         Args:
             rule_id: The ID of the rule being changed.
+            entity_id: The entity ID that initiated the change.
+            change_type: Type of change (enabled, disabled, modified).
             timeout: How long (in seconds) to keep the registration active.
         """
         self._ha_initiated_operations[rule_id] = time.time()
         LOGGER.debug("[CQRS] Registered HA-initiated operation for rule_id: %s", rule_id)
         
+        # Register with smart polling system for debounced refresh
+        self.hass.async_create_task(
+            self.smart_polling.register_entity_change(entity_id, change_type)
+        )
+        
         # Schedule cleanup to prevent the dictionary from growing indefinitely
-        # if a corresponding websocket event never arrives.
+        # if a corresponding change detection never occurs.
         async def cleanup_op(op_rule_id):
             await asyncio.sleep(timeout)
             if op_rule_id in self._ha_initiated_operations:
@@ -168,6 +197,236 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
             del self._ha_initiated_operations[rule_id]
             return True
         return False
+
+    def fire_device_trigger_via_dispatcher(self, device_id: str, device_name: str, change_type: str, old_state: Any = None, new_state: Any = None) -> None:
+        """Fire device_changed triggers using Home Assistant's dispatcher pattern.
+        
+        This method dispatches device change events that trigger instances can listen for.
+        Uses the same dispatcher pattern as other coordinator events for consistency.
+        
+        Args:
+            device_id: The ID of the device that changed (e.g., MAC address)
+            device_name: Human-readable name of the device
+            change_type: Type of change (e.g., "led_toggled", "reboot")
+            old_state: Previous state of the device property
+            new_state: New state of the device property
+        """
+        if LOG_TRIGGERS:
+            LOGGER.info("🔥 COORDINATOR: Dispatching device trigger for %s (%s): %s", 
+                       device_name, device_id, change_type)
+        
+        # Prepare trigger data
+        trigger_data = {
+            "device_id": device_id,
+            "device_name": device_name,
+            "change_type": change_type,
+            "old_state": old_state,
+            "new_state": new_state,
+            "trigger_type": "device_changed"
+        }
+        
+        # Dispatch via Home Assistant's dispatcher system
+        try:
+            # Get entry_id for this coordinator
+            entry_id = self.config_entry.entry_id if self.config_entry else "unknown"
+            signal_name = f"{DOMAIN}_device_trigger_{entry_id}"
+            
+            async_dispatcher_send(self.hass, signal_name, trigger_data)
+            
+            if LOG_TRIGGERS:
+                LOGGER.info("✅ COORDINATOR: Dispatched device trigger signal: %s", signal_name)
+                
+        except Exception as err:
+            LOGGER.error("Error dispatching device trigger: %s", err)
+
+    async def register_external_change_detected(self) -> None:
+        """Register that external changes were detected during polling.
+        
+        This helps the smart polling system maintain appropriate polling intervals
+        when changes are detected via periodic polling (not HA-initiated).
+        """
+        await self.smart_polling.register_external_change_detected()
+        
+    def get_smart_polling_status(self) -> Dict[str, Any]:
+        """Get smart polling status for diagnostics.
+        
+        Returns:
+            Dictionary with current smart polling status
+        """
+        return self.smart_polling.get_status()
+    
+    def get_change_detector_status(self) -> Dict[str, Any]:
+        """Get change detector status for diagnostics.
+        
+        Returns:
+            Dictionary with current change detector status
+        """
+        return self.change_detector.get_status()
+    
+    def _data_has_changes(self, previous_data: Dict[str, List[Any]], new_data: Dict[str, List[Any]]) -> bool:
+        """Check if data has changed between polling cycles.
+        
+        This is used to detect external changes (not HA-initiated) during polling.
+        
+        Args:
+            previous_data: The previous data from coordinator
+            new_data: The new data from coordinator
+            
+        Returns:
+            True if changes were detected, False otherwise
+        """
+        if not previous_data or not new_data:
+            return False
+            
+        # Quick check: compare collection sizes first
+        for rule_type in ["port_forwards", "traffic_routes", "static_routes", "firewall_policies", 
+                         "traffic_rules", "legacy_firewall_rules", "wlans", 
+                         "firewall_zones", "qos_rules", "vpn_clients", "vpn_servers", 
+                         "devices", "port_profiles", "networks"]:
+            prev_count = len(previous_data.get(rule_type, []))
+            new_count = len(new_data.get(rule_type, []))
+            if prev_count != new_count:
+                LOGGER.debug("[SMART_POLL] Count change detected in %s: %d → %d", rule_type, prev_count, new_count)
+                return True
+        
+        # If counts are the same, do a deeper check on enabled states and key attributes
+        # This is a lightweight check focused on the most common changes
+        for rule_type in ["port_forwards", "traffic_routes", "static_routes", "firewall_policies", 
+                         "traffic_rules", "legacy_firewall_rules", "wlans", "qos_rules"]:
+            prev_rules = previous_data.get(rule_type, [])
+            new_rules = new_data.get(rule_type, [])
+            
+            # Create lookup dictionaries for efficient comparison
+            prev_lookup = {}
+            new_lookup = {}
+            
+            for rule in prev_rules:
+                rule_id = getattr(rule, 'id', None) or (rule.raw.get('_id') if hasattr(rule, 'raw') else None)
+                if rule_id:
+                    enabled = getattr(rule, 'enabled', None) or (rule.raw.get('enabled') if hasattr(rule, 'raw') else None)
+                    prev_lookup[rule_id] = enabled
+                    
+            for rule in new_rules:
+                rule_id = getattr(rule, 'id', None) or (rule.raw.get('_id') if hasattr(rule, 'raw') else None)
+                if rule_id:
+                    enabled = getattr(rule, 'enabled', None) or (rule.raw.get('enabled') if hasattr(rule, 'raw') else None)
+                    new_lookup[rule_id] = enabled
+            
+            # Check for enabled state changes
+            for rule_id in prev_lookup:
+                if rule_id in new_lookup:
+                    if prev_lookup[rule_id] != new_lookup[rule_id]:
+                        LOGGER.debug("[SMART_POLL] Enabled state change detected in %s rule %s: %s → %s", 
+                                   rule_type, rule_id, prev_lookup[rule_id], new_lookup[rule_id])
+                        return True
+        
+        return False
+
+    def _check_for_device_state_changes(self, previous_data: Dict[str, List[Any]], new_data: Dict[str, List[Any]]) -> None:
+        """Check for LED state changes on devices and fire device triggers accordingly.
+        
+        This detects LED changes during regular coordinator polling cycles as part
+        of the unified change detection system.
+        
+        Note: Only monitors LED state changes for devices we manage (LED-capable access points).
+        Connection state monitoring is handled by the core UniFi integration.
+        
+        Args:
+            previous_data: The previous coordinator data
+            new_data: The current coordinator data
+        """
+        if not previous_data or not new_data:
+            LOGGER.debug("Skipping device LED state change detection - no previous or new data")
+            return
+            
+        previous_devices = previous_data.get("devices", [])
+        new_devices = new_data.get("devices", [])
+        
+        if not previous_devices and not new_devices:
+            return  # No devices to compare
+            
+        # Create lookup dictionaries by device MAC for efficient comparison
+        previous_device_states = {}
+        for device in previous_devices:
+            try:
+                device_id = getattr(device, 'mac', getattr(device, 'id', None))
+                if device_id:
+                    previous_device_states[device_id] = {
+                        'led_override': getattr(device, 'led_override', None),
+                        'name': getattr(device, 'name', f"Device {device_id}"),
+                    }
+            except Exception as err:
+                LOGGER.warning("Error processing previous device LED state: %s", err)
+                
+        new_device_states = {}
+        for device in new_devices:
+            try:
+                device_id = getattr(device, 'mac', getattr(device, 'id', None))
+                if device_id:
+                    new_device_states[device_id] = {
+                        'led_override': getattr(device, 'led_override', None),
+                        'name': getattr(device, 'name', f"Device {device_id}"),
+                    }
+            except Exception as err:
+                LOGGER.warning("Error processing new device LED state: %s", err)
+        
+        # Compare device LED states and fire triggers for changes
+        all_device_ids = set(previous_device_states.keys()) | set(new_device_states.keys())
+        
+        # Build lookup for full device objects
+        previous_devices_lookup = {}
+        new_devices_lookup = {}
+        
+        for device in previous_devices:
+            device_id = getattr(device, 'mac', getattr(device, 'id', None))
+            if device_id:
+                previous_devices_lookup[device_id] = device
+        
+        for device in new_devices:
+            device_id = getattr(device, 'mac', getattr(device, 'id', None))
+            if device_id:
+                new_devices_lookup[device_id] = device
+        
+        for device_id in all_device_ids:
+            previous_state = previous_device_states.get(device_id)
+            new_state = new_device_states.get(device_id)
+            
+            # Skip if device was just added or removed (handled elsewhere)
+            if not previous_state or not new_state:
+                continue
+                
+            # Check for LED state changes only
+            prev_led = previous_state.get('led_override')
+            new_led = new_state.get('led_override')
+            
+            if prev_led != new_led:
+                device_name = new_state.get('name', f"Device {device_id}")
+                
+                # Get full device objects for trigger payload (consistent with rule triggers)
+                previous_device_obj = previous_devices_lookup.get(device_id)
+                new_device_obj = new_devices_lookup.get(device_id)
+                
+                # Check if this was an HA-initiated operation to avoid duplicate triggers
+                was_ha_initiated = self.check_and_consume_ha_initiated_operation(device_id)
+                
+                if was_ha_initiated:
+                    if LOG_TRIGGERS:
+                        LOGGER.info("🔄 DEVICE LED CHANGE: %s (%s) LED: %s → %s [HA-INITIATED - Skipping duplicate trigger]", 
+                                   device_name, device_id, prev_led, new_led)
+                else:
+                    if LOG_TRIGGERS:
+                        LOGGER.info("🔍 DEVICE LED CHANGE DETECTED: %s (%s) LED: %s → %s [EXTERNAL CHANGE - Firing trigger]", 
+                                   device_name, device_id, prev_led, new_led)
+                    
+                    # Fire device trigger via dispatcher (external change)
+                    # Pass full device objects like rule triggers do
+                    self.fire_device_trigger_via_dispatcher(
+                        device_id=device_id,
+                        device_name=device_name,
+                        change_type="led_toggled",
+                        old_state=previous_device_obj,  # Full device object (consistent with rule triggers)
+                        new_state=new_device_obj        # Full device object (consistent with rule triggers)
+                    )
 
     async def _async_update_data(self) -> Dict[str, List[Any]]:
         """Fetch data from API endpoint."""
@@ -223,6 +482,9 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                     "vpn_clients": [],
                     "vpn_servers": [],
                     "devices": [],
+                    "port_profiles": [],
+                    "networks": [],
+                    "static_routes": [],
                 }
 
                 # Store the previous data to detect deletions and protect against API failures
@@ -271,7 +533,7 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                             LOGGER.warning("Authentication failure detected during initial fetch: %s", error_msg)
                             # Trigger auth recovery but continue trying other endpoints
                             if hasattr(self.api, "handle_auth_failure"):
-                                recovery_task = asyncio.create_task(self.api.handle_auth_failure(error_msg))
+                                self.hass.async_create_task(self.api.handle_auth_failure(error_msg))
 
                             # Preserve previous port forwards data if available
                             if previous_data and "port_forwards" in previous_data and previous_data["port_forwards"]:
@@ -302,6 +564,22 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                 await self._update_traffic_rules_in_dict(rules_data)
                 await asyncio.sleep(api_call_delay)
 
+                # Then networks (manageable LAN/WAN networks only)
+                await self._update_networks_in_dict(rules_data)
+                await asyncio.sleep(api_call_delay)
+
+                # Then VPN clients (extracted from network configs)
+                await self._update_vpn_clients_in_dict(rules_data)
+                await asyncio.sleep(api_call_delay)
+
+                # Then VPN servers (extracted from network configs)
+                await self._update_vpn_servers_in_dict(rules_data)
+                await asyncio.sleep(api_call_delay)
+
+                # Then static routes
+                await self._update_static_routes_in_dict(rules_data)
+                await asyncio.sleep(api_call_delay)
+
                 # Then legacy firewall rules
                 await self._update_legacy_firewall_rules_in_dict(rules_data)
                 await asyncio.sleep(api_call_delay)
@@ -310,16 +588,14 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                 await self._update_qos_rules_in_dict(rules_data)
                 await asyncio.sleep(api_call_delay)
                 
-                # Then VPN clients
-                await self._update_vpn_clients_in_dict(rules_data)
-                await asyncio.sleep(api_call_delay)
-                
-                # Then VPN servers
-                await self._update_vpn_servers_in_dict(rules_data)
-                await asyncio.sleep(api_call_delay)
+                # VPN clients and servers are now extracted during network processing
                 
                 # Then devices (for LED switches)
                 await self._update_devices_in_dict(rules_data)
+                await asyncio.sleep(api_call_delay)
+
+                # Then port profiles
+                await self._update_port_profiles_in_dict(rules_data)
 
                 # Verify the data is valid - check if we have at least some data in key categories
                 # This helps prevent entity removal during temporary API errors
@@ -329,16 +605,20 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                     len(rules_data["port_forwards"]) > 0 or
                     len(rules_data["qos_rules"]) > 0 or
                     len(rules_data["traffic_routes"]) > 0 or
-                    len(rules_data["legacy_firewall_rules"]) > 0
+                    len(rules_data["static_routes"]) > 0 or
+                    len(rules_data["legacy_firewall_rules"]) > 0 or
+                    len(rules_data["port_profiles"]) > 0 or
+                    len(rules_data["networks"]) > 0 or
+                    len(rules_data["devices"]) > 0
                 )
 
                 # Special handling for authentication failures detected during update
                 if auth_failure_during_update:
                     LOGGER.warning("Authentication issues detected during update - preserving existing data")
                     # If authentication failures occurred, preserve previous data for key categories
-                    for key in ["port_forwards", "firewall_policies", "traffic_rules", "traffic_routes"]:
+                    for key in ["port_forwards", "firewall_policies", "traffic_rules", "traffic_routes", "static_routes"]:
                         if not rules_data[key] and previous_data and key in previous_data and previous_data[key]:
-                            LOGGER.info(f"Preserving previous {key} data due to authentication issues")
+                            LOGGER.info("Preserving previous %s data due to authentication issues", key)
                             rules_data[key] = previous_data[key]
 
                 # Check any API responses for auth errors
@@ -353,7 +633,7 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                 # If we get no data but had data before, likely a temporary API issue
                 if not data_valid and previous_data and any(
                     len(previous_data.get(key, [])) > 0 
-                    for key in ["firewall_policies", "traffic_rules", "port_forwards", "traffic_routes"]
+                    for key in ["firewall_policies", "traffic_rules", "port_forwards", "traffic_routes", "static_routes"]
                 ):
                     # We're in a potential error state
                     self._consecutive_errors += 1
@@ -417,12 +697,16 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                         # --- Check for DELETED Entities ---
                         self._check_for_deleted_rules(rules_data)
 
+                        # --- Check for LED State Changes ---
+                        self._check_for_device_state_changes(previous_data, rules_data)
+
                         # --- Discover and Add NEW Entities --- 
                         await self._discover_and_add_new_entities(rules_data)
 
                     # --- Update Internal Collections --- 
                     self.port_forwards = rules_data.get("port_forwards", [])
                     self.traffic_routes = rules_data.get("traffic_routes", [])
+                    self.static_routes = rules_data.get("static_routes", [])
                     self.firewall_policies = rules_data.get("firewall_policies", [])
                     self.traffic_rules = rules_data.get("traffic_rules", [])
                     self.legacy_firewall_rules = rules_data.get("legacy_firewall_rules", [])
@@ -432,10 +716,13 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                     self.vpn_clients = rules_data.get("vpn_clients", [])
                     self.vpn_servers = rules_data.get("vpn_servers", [])
                     self.devices = rules_data.get("devices", [])
+                    self.port_profiles = rules_data.get("port_profiles", [])
+                    self.networks = rules_data.get("networks", [])
 
-                    LOGGER.info("Rule collections after refresh: Port Forwards=%d, Traffic Routes=%d, Firewall Policies=%d, Traffic Rules=%d, Legacy Firewall Rules=%d, WLANs=%d, QoS Rules=%d, VPN Clients=%d, VPN Servers=%d, Devices=%d", 
+                    LOGGER.info("Rule collections after refresh: Port Forwards=%d, Traffic Routes=%d, Static Routes=%d, Firewall Policies=%d, Traffic Rules=%d, Legacy Firewall Rules=%d, WLANs=%d, QoS Rules=%d, VPN Clients=%d, VPN Servers=%d, Networks=%d, Devices=%d", 
                                len(self.port_forwards),
                                len(self.traffic_routes),
+                               len(self.static_routes),
                                len(self.firewall_policies),
                                len(self.traffic_rules),
                                len(self.legacy_firewall_rules),
@@ -443,7 +730,28 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                                len(self.qos_rules),
                                len(self.vpn_clients),
                                len(self.vpn_servers),
+                               len(self.networks),
                                len(self.devices))
+
+                    # Check if external changes were detected during baseline polling cycle
+                    # Only register external changes if this wasn't triggered by our own smart polling
+                    if previous_data and self._data_has_changes(previous_data, rules_data):
+                        # Avoid feedback loop: don't register external changes during smart polling cycles
+                        if not self.smart_polling.is_in_smart_poll_cycle():
+                            LOGGER.debug("[SMART_POLL] External changes detected during baseline polling cycle")
+                            await self.register_external_change_detected()
+                        else:
+                            LOGGER.debug("[SMART_POLL] Changes detected during smart polling cycle - not registering as external")
+
+                    # Run unified change detection and fire triggers
+                    try:
+                        changes = await self.change_detector.detect_and_fire_changes(rules_data)
+                        if changes:
+                            LOGGER.info("[UNIFIED_TRIGGERS] Detected %d changes, fired unified triggers", len(changes))
+                        else:
+                            LOGGER.debug("[UNIFIED_TRIGGERS] No changes detected during this update cycle")
+                    except Exception as change_err:
+                        LOGGER.error("[UNIFIED_TRIGGERS] Error in change detection: %s", change_err)
 
                 return rules_data
 
@@ -451,10 +759,11 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                 LOGGER.error("Error updating coordinator data: %s", err)
 
                 # Check if this is an authentication error
-                auth_error = False
+                # Track auth errors for control flow only (no use afterwards)
+                _auth_error = False
                 error_str = str(err).lower()
                 if "401 unauthorized" in error_str or "403 forbidden" in error_str:
-                    auth_error = True
+                    _auth_error = True
                     self._auth_failures += 1
                     self._authentication_in_progress = True
                     try:
@@ -502,6 +811,7 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         all_rule_sources_types = [
             "port_forwards",
             "traffic_routes",
+            "static_routes",
             "firewall_policies",
             "traffic_rules",
             "legacy_firewall_rules",
@@ -509,22 +819,24 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
             "wlans",
             "vpn_clients",
             "vpn_servers",
+            "port_profiles",
+            "networks",
         ]
         
         for rule_type in all_rule_sources_types:
-             rules = new_data.get(rule_type, [])
-             if rules:
-                 for rule in rules:
-                     try:
-                         rule_id = get_rule_id(rule)
-                         if rule_id:
-                             all_current_unique_ids.add(rule_id)
-                             # Add kill switch ID if applicable
-                             if rule_type == "traffic_routes" and hasattr(rule, 'raw') and "kill_switch_enabled" in rule.raw:
-                                 kill_switch_id = get_child_unique_id(rule_id, "kill_switch")
-                                 all_current_unique_ids.add(kill_switch_id)
-                     except Exception as e:
-                          LOGGER.warning("Error getting ID during deletion check for %s: %s", rule_type, e)
+            rules = new_data.get(rule_type, [])
+            if rules:
+                for rule in rules:
+                    try:
+                        rule_id = get_rule_id(rule)
+                        if rule_id:
+                            all_current_unique_ids.add(rule_id)
+                            # Add kill switch ID if applicable
+                            if rule_type == "traffic_routes" and hasattr(rule, 'raw') and "kill_switch_enabled" in rule.raw:
+                                kill_switch_id = get_child_unique_id(rule_id, "kill_switch")
+                                all_current_unique_ids.add(kill_switch_id)
+                    except Exception as e:
+                        LOGGER.warning("Error getting ID during deletion check for %s: %s", rule_type, e)
 
         # Special handling for device LED switches in deletion check
         devices = new_data.get("devices", [])
@@ -539,12 +851,13 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         deleted_unique_ids = current_known_ids - all_current_unique_ids
         LOGGER.debug("Deletion Check Final: Known IDs (Snapshot): %d, Current IDs (Calculated): %d, To Delete: %d",
                      len(current_known_ids), len(all_current_unique_ids), len(deleted_unique_ids))
+        
 
         if deleted_unique_ids:
             # Process deletions using the identified IDs and the snapshot count
             self._process_deleted_rules("various_orphaned", deleted_unique_ids, len(self.known_unique_ids))
         else:
-             LOGGER.debug("Deletion check: No discrepancies found between known IDs and current data.")
+            LOGGER.debug("Deletion check: No discrepancies found between known IDs and current data.")
 
     def _process_deleted_rules(self, rule_type: str, deleted_ids: set, total_previous_count: int) -> None:
         """Process detected rule deletions and dispatch removal events.
@@ -581,7 +894,6 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
 
         # Dispatch deletion events for each deleted rule
         for rule_id in deleted_ids:
-            # LOGGER.info("Processing deletion for rule_id: %s", rule_id)
             # Use _remove_entity which handles both callback and dispatching signals
             self.hass.async_create_task(self._remove_entity_async(rule_id))
 
@@ -655,61 +967,51 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         """Update QoS rules in the given data dictionary."""
         await self._update_rule_type_in_dict(data, "qos_rules", self.api.get_qos_rules)
 
-    async def _update_vpn_clients_in_dict(self, data: Dict[str, List[Any]]) -> None:
-        """Update VPN clients in the given data dictionary."""
-        await self._update_rule_type_in_dict(data, "vpn_clients", self.api.get_vpn_clients)
+    async def _update_static_routes_in_dict(self, data: Dict[str, List[Any]]) -> None:
+        """Update static routes in the given data dictionary."""
+        await self._update_rule_type_in_dict(data, "static_routes", self.api.get_static_routes)
 
-    async def _update_vpn_servers_in_dict(self, data: Dict[str, List[Any]]) -> None:
-        """Update VPN servers in the given data dictionary."""
-        await self._update_rule_type_in_dict(data, "vpn_servers", self.api.get_vpn_servers)
+    async def _update_rule_type_in_dict(self, data: Dict[str, List[Any]], rule_type: str, api_method) -> None:
+        """Generic method to update rule types in the data dictionary.
         
+        Args:
+            data: The data dictionary to update
+            rule_type: The type of rule (e.g., "firewall_policies", "traffic_routes")
+            api_method: The API method to call to fetch the rules
+        """
+        try:
+            LOGGER.info("Fetching %s...", rule_type)
+            future = await self.api.queue_api_operation(api_method)
+            rules = await future if hasattr(future, "__await__") else future
+            data[rule_type] = rules or []
+            setattr(self, rule_type, data[rule_type])
+            LOGGER.info("Updated %d %s", len(data[rule_type]), rule_type)
+        except Exception as err:
+            LOGGER.error("Failed to update %s: %s", rule_type, err)
+            data[rule_type] = []
+            if not hasattr(self, rule_type):
+                setattr(self, rule_type, [])
+
     async def _update_devices_in_dict(self, data: Dict[str, List[Any]]) -> None:
         """Update devices in the data dictionary."""
         try:
-            LOGGER.info("Fetching devices for LED switches...")
+            LOGGER.info("Fetching LED-capable devices for LED switches...")
             
-            # Get LED states from the stat/device endpoint (has comprehensive device data including LED states)
-            led_states = await self.api.get_device_led_states()
-            LOGGER.info("Retrieved LED states for %d devices from stat/device", len(led_states))
+            # Get LED-capable devices (access points with LED support) as properly typed Device objects
+            led_capable_devices = await self.api.get_device_led_states()
+            LOGGER.info("Retrieved %d LED-capable Device objects", len(led_capable_devices))
             
-            # Debug: Print LED states found
-            if led_states:
+            if led_capable_devices:
                 LOGGER.info("LED-capable devices found:")
-                for mac, led_info in led_states.items():
+                for device in led_capable_devices:
+                    device_mac = getattr(device, 'mac', getattr(device, 'id', 'unknown'))
+                    device_name = getattr(device, 'name', 'Unknown')
+                    led_state = getattr(device, 'led_override', 'unknown')
+                    device_model = getattr(device, 'model', 'Unknown')
                     LOGGER.info("  %s (%s): LED=%s, Model=%s", 
-                              led_info['name'], mac, led_info.get('led_override', 'unknown'), led_info['model'])
+                              device_name, device_mac, led_state, device_model)
             
-            # Create Device objects directly from the comprehensive LED states data
-            # This avoids the issue where v2 /device endpoint may not return all devices
-            led_capable_devices = []
-            for mac, led_info in led_states.items():
-                try:
-                    # Create a device data structure from the LED info
-                    device_data = {
-                        'mac': mac,
-                        '_id': led_info.get('_id', mac),  # Use _id if available, fallback to mac
-                        'device_id': led_info.get('_id', mac),   # Device ID field expected by Device class
-                        'name': led_info['name'],
-                        'model': led_info['model'],
-                        'type': led_info['type'],
-                        'is_access_point': led_info['is_access_point'],
-                        'led_override': led_info.get('led_override'),
-                        'led_override_color': led_info.get('led_override_color'),
-                        'led_override_color_brightness': led_info.get('led_override_color_brightness'),
-                        'state': led_info.get('state', 1),  # Device connection state
-                    }
-                    
-                    # Create Device object from this data
-                    device = Device(device_data)
-                    led_capable_devices.append(device)
-                    LOGGER.info("Created LED-capable device: %s (%s) - LED state: %s", 
-                              led_info['name'], mac, led_info.get('led_override', 'unknown'))
-                    
-                except Exception as device_err:
-                    LOGGER.warning("Error creating device object for %s (%s): %s", 
-                                 led_info.get('name', 'unknown'), mac, str(device_err))
-                    continue
-            
+            # Use Device objects directly to represent LED-capable devices with their current states
             data["devices"] = led_capable_devices
             self.devices = led_capable_devices
             LOGGER.info("Updated %d LED-capable devices with current LED states", len(led_capable_devices))
@@ -720,6 +1022,39 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
             data["devices"] = []
             if not hasattr(self, 'devices'):
                 self.devices = []
+
+    async def _update_port_profiles_in_dict(self, data: Dict[str, List[Any]]) -> None:
+        """Update port profiles in the data dictionary and convert to typed objects."""
+        try:
+            LOGGER.info("Fetching port profiles...")
+            future = await self.api.queue_api_operation(self.api.get_port_profiles)
+            profiles = await future if hasattr(future, "__await__") else future
+            typed: List[PortProfile] = []
+            for item in profiles or []:
+                try:
+                    typed.append(PortProfile(item))
+                except Exception as err:
+                    LOGGER.warning("Error converting port profile: %s", err)
+            data["port_profiles"] = typed
+            self.port_profiles = typed
+            LOGGER.info("Updated %d port profiles", len(typed))
+        except Exception as err:
+            LOGGER.error("Failed to update port profiles: %s", err)
+            data["port_profiles"] = []
+            if not hasattr(self, 'port_profiles'):
+                self.port_profiles = []
+
+    async def _update_networks_in_dict(self, data: Dict[str, List[Any]]) -> None:
+        """Update manageable network configurations in the given data dictionary."""
+        await self._update_rule_type_in_dict(data, "networks", self.api.get_networks)
+
+    async def _update_vpn_clients_in_dict(self, data: Dict[str, List[Any]]) -> None:
+        """Update VPN client configurations in the given data dictionary."""
+        await self._update_rule_type_in_dict(data, "vpn_clients", self.api.get_vpn_clients)
+
+    async def _update_vpn_servers_in_dict(self, data: Dict[str, List[Any]]) -> None:
+        """Update VPN server configurations in the given data dictionary."""
+        await self._update_rule_type_in_dict(data, "vpn_servers", self.api.get_vpn_servers)
 
     async def _update_rule_type(self, rule_type: str, fetch_method: Callable) -> None:
         """Update a specific rule type in self.data.
@@ -780,7 +1115,7 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                         # Don't update with untyped data
                         return
 
-                    # Log rule details for debugging
+                    # Log rule details
                     rule_id = getattr(first_rule, "id", "unknown")
                     LOGGER.debug(
                         "First %s rule: ID=%s, Type=%s",
@@ -826,18 +1161,7 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
             if rule_type not in target_data:
                 target_data[rule_type] = []
 
-    @callback
-    def _handle_websocket_message(self, message: dict[str, Any]) -> None:
-        """Handle a message from the WebSocket connection.
-        
-        NOTE: This method is now primarily handled by the trigger system.
-        Triggers detect config changes and dispatch refreshes directly via _dispatch_coordinator_refresh().
-        This keeps the detection logic DRY and centralized in one place.
-        """
-        # The trigger system now handles all websocket message detection and dispatches
-        # coordinator refreshes when config changes are detected. This method is kept
-        # for backward compatibility but should only be called as a fallback.
-        pass
+    # WebSocket message handling removed - using smart polling only
 
     async def _controlled_refresh_wrapper(self):
         """Wrapper for the controlled refresh process to ensure proper semaphore handling."""
@@ -855,22 +1179,16 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
     async def _force_refresh_with_cache_clear(self) -> None:
         """Force a refresh with cache clearing to ensure fresh data.
         
-        This method is triggered by WebSocket events and follows the same core refresh
+        This method is triggered by smart polling and follows the same core refresh
         and entity management logic as the regular polling updates:
         1. Clear API cache (but preserve authentication)
         2. Call async_refresh() which updates rule collections
         3. Process new entities through the same entity creation path
         4. Check for deleted rules to maintain consistency with polling
-        
-        The only major difference is the explicit call to _check_for_deleted_rules()
-        which happens automatically during polling updates.
         """
         try:
             # Log that we're starting a refresh
-            log_websocket("Starting forced refresh after rule change detected")
-            
-            # Store previous data for deletion detection
-            previous_data = self.data.copy() if self.data else {}
+            LOGGER.debug("Starting forced refresh after change detected")
             
             # Clear the API cache to ensure we get fresh data
             # But do so without disrupting authentication
@@ -887,9 +1205,6 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
             
             if refresh_successful:
                 # After refreshing data, discovery and deletion checks are handled within async_refresh -> _async_update_data
-                # REMOVED: await self.process_new_entities() # Redundant
-                # REMOVED: if previous_data: # Incorrect check
-                # REMOVED:     self._check_for_deleted_rules(previous_data) # Incorrect check
                 
                 # Update the data timestamp
                 self._last_update = self.hass.loop.time()
@@ -897,9 +1212,9 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                 # Force an update of all entities
                 self.async_update_listeners()
                 
-                log_data("Refresh completed successfully after WebSocket event")
+                log_data("Refresh completed successfully after change detection")
             else:
-                LOGGER.error("WebSocket-triggered refresh failed")
+                LOGGER.error("Change-triggered refresh failed")
         except Exception as err:
             LOGGER.error("Error during forced refresh: %s", err)
 
@@ -911,6 +1226,10 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
             
     async def async_shutdown(self) -> None:
         """Clean up resources asynchronously."""
+        # Clean up smart polling first
+        if hasattr(self, 'smart_polling'):
+            await self.smart_polling.cleanup()
+        
         # Call the synchronous shutdown method
         self.shutdown()
         
@@ -955,11 +1274,6 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         self._entity_removal_callback = callback
         LOGGER.debug("Entity removal callback registered")
 
-    async def _schedule_queue_reprocessing(self) -> None:
-        """Schedule a delayed reprocessing of the entity creation queue."""
-        import asyncio
-        await asyncio.sleep(5)  # Wait 5 seconds before retrying
-        await self._process_entity_queue()
 
     async def process_new_entities(self) -> None:
         """Process and create entities that were discovered."""
@@ -973,6 +1287,11 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         
         routes_to_add = {
             get_rule_id(rule) for rule in self.traffic_routes 
+            if get_rule_id(rule) not in self.known_unique_ids and get_rule_id(rule) is not None
+        }
+        
+        static_routes_to_add = {
+            get_rule_id(rule) for rule in self.static_routes 
             if get_rule_id(rule) not in self.known_unique_ids and get_rule_id(rule) is not None
         }
         
@@ -1025,102 +1344,89 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                 len(qos_rules_to_add), len(vpn_clients_to_add), len(vpn_servers_to_add)
             )
         
-        # Queue new entities for creation
+        # Track new entities for creation (queue system removed - entities created directly)
         for rule in self.port_forwards:
             rule_id = get_rule_id(rule)
             if rule_id in port_forwards_to_add:
-                LOGGER.debug("Queueing new port forward for creation: %s (class: %s)", 
+                LOGGER.debug("Tracking new port forward for creation: %s (class: %s)", 
                            rule_id, type(rule).__name__)
-                # Ensure rule is valid before queueing
+                # Ensure rule is valid before tracking
                 if hasattr(rule, 'id'):
-                    self._entity_creation_queue.append({
-                        "rule_type": "port_forwards",
-                        "rule": rule
-                    })
                     self.known_unique_ids.add(rule_id)
                 else:
-                    LOGGER.error("Cannot queue port forward rule without id attribute")
+                    LOGGER.error("Cannot track port forward rule without id attribute")
                 
         for rule in self.traffic_routes:
             rule_id = get_rule_id(rule)
             if rule_id in routes_to_add:
-                LOGGER.debug("Queueing new traffic route for creation: %s (class: %s)", 
+                LOGGER.debug("Tracking new traffic route for creation: %s (class: %s)", 
                            rule_id, type(rule).__name__)
-                # Ensure rule is valid before queueing
+                # Ensure rule is valid before tracking
                 if hasattr(rule, 'id'):
-                    self._entity_creation_queue.append({
-                        "rule_type": "traffic_routes",
-                        "rule": rule
-                    })
                     self.known_unique_ids.add(rule_id)
                 else:
-                    LOGGER.error("Cannot queue traffic route rule without id attribute")
+                    LOGGER.error("Cannot track traffic route rule without id attribute")
+                
+        for rule in self.static_routes:
+            rule_id = get_rule_id(rule)
+            if rule_id in static_routes_to_add:
+                LOGGER.debug("Tracking new static route for creation: %s (class: %s)", 
+                           rule_id, type(rule).__name__)
+                # Ensure rule is valid before tracking
+                if hasattr(rule, 'id'):
+                    self.known_unique_ids.add(rule_id)
+                else:
+                    LOGGER.error("Cannot track static route rule without id attribute")
                 
         for rule in self.firewall_policies:
             rule_id = get_rule_id(rule)
             if rule_id in policies_to_add:
                 LOGGER.debug(
-                    "Queueing new firewall policy for creation: %s (class: %s)",
+                    "Tracking new firewall policy for creation: %s (class: %s)",
                     rule_id, 
                     type(rule).__name__
                 )
-                # Ensure rule is valid before queueing
+                # Ensure rule is valid before tracking
                 if hasattr(rule, 'id'):
-                    self._entity_creation_queue.append({
-                        "rule_type": "firewall_policies",
-                        "rule": rule
-                    })
                     self.known_unique_ids.add(rule_id)
                 else:
-                    LOGGER.error("Cannot queue firewall policy rule without id attribute")
+                    LOGGER.error("Cannot track firewall policy rule without id attribute")
 
         for rule in self.traffic_rules:
             rule_id = get_rule_id(rule)
             if rule_id in traffic_rules_to_add:
-                LOGGER.debug("Queueing new traffic rule for creation: %s (class: %s)", 
+                LOGGER.debug("Tracking new traffic rule for creation: %s (class: %s)", 
                           rule_id, type(rule).__name__)
-                # Ensure rule is valid before queueing
+                # Ensure rule is valid before tracking
                 if hasattr(rule, 'id'):
-                    self._entity_creation_queue.append({
-                        "rule_type": "traffic_rules",
-                        "rule": rule
-                    })
                     self.known_unique_ids.add(rule_id)
                 else:
-                    LOGGER.error("Cannot queue traffic rule without id attribute")
+                    LOGGER.error("Cannot track traffic rule without id attribute")
                 
         for rule in self.legacy_firewall_rules:
             rule_id = get_rule_id(rule)
             if rule_id in firewall_rules_to_add:
-                LOGGER.debug("Queueing new firewall rule for creation: %s (class: %s)", 
+                LOGGER.debug("Tracking new firewall rule for creation: %s (class: %s)", 
                           rule_id, type(rule).__name__)
-                # Ensure rule is valid before queueing
+                # Ensure rule is valid before tracking
                 if hasattr(rule, 'id'):
-                    self._entity_creation_queue.append({
-                        "rule_type": "legacy_firewall_rules",
-                        "rule": rule
-                    })
                     self.known_unique_ids.add(rule_id)
                 else:
-                    LOGGER.error("Cannot queue legacy firewall rule without id attribute")
+                    LOGGER.error("Cannot track legacy firewall rule without id attribute")
                 
         for rule in self.wlans:
             rule_id = get_rule_id(rule)
             if rule_id in wlans_to_add:
                 LOGGER.debug(
-                    "Queueing new WLAN for creation: %s (class: %s)",
+                    "Tracking new WLAN for creation: %s (class: %s)",
                     rule_id, 
                     type(rule).__name__
                 )
-                # Ensure rule is valid before queueing
+                # Ensure rule is valid before tracking
                 if hasattr(rule, 'id'):
-                    self._entity_creation_queue.append({
-                        "rule_type": "wlans",
-                        "rule": rule
-                    })
                     self.known_unique_ids.add(rule_id)
                 else:
-                    LOGGER.error("Cannot queue WLAN rule without id attribute")
+                    LOGGER.error("Cannot track WLAN rule without id attribute")
                     
         # Add section for QoS rules
         for rule in self.qos_rules:
@@ -1131,20 +1437,16 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                        rule_id in qos_rules_to_add)
             if rule_id in qos_rules_to_add:
                 LOGGER.debug(
-                    "Queueing new QoS rule for creation: %s (class: %s)",
+                    "Tracking new QoS rule for creation: %s (class: %s)",
                     rule_id, 
                     type(rule).__name__
                 )
-                # Ensure rule is valid before queueing
+                # Ensure rule is valid before tracking
                 if hasattr(rule, 'id'):
-                    LOGGER.info("Adding QoS rule to entity creation queue: %s", rule_id)
-                    self._entity_creation_queue.append({
-                        "rule_type": "qos_rules",
-                        "rule": rule
-                    })
+                    LOGGER.info("Tracking QoS rule for entity creation: %s", rule_id)
                     self.known_unique_ids.add(rule_id)
                 else:
-                    LOGGER.error("Cannot queue QoS rule without id attribute")
+                    LOGGER.error("Cannot track QoS rule without id attribute")
 
         # Process VPN clients
         for rule in self.vpn_clients:
@@ -1156,14 +1458,10 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                     continue
                     
                 if rule_id in vpn_clients_to_add:
-                    LOGGER.debug("Adding new VPN client entity: %s", rule_id)
-                    self._entity_creation_queue.append({
-                        "rule_data": rule,
-                        "rule_type": "vpn_clients",
-                        "entity_class": None,  # Will be determined during creation
-                    })
+                    LOGGER.debug("Tracking new VPN client entity: %s", rule_id)
+                    self.known_unique_ids.add(rule_id)
             except Exception as err:
-                LOGGER.exception("Error processing VPN client for entity creation: %s", err)
+                LOGGER.exception("Error processing VPN client for entity tracking: %s", err)
                 
         # Process VPN servers
         for rule in self.vpn_servers:
@@ -1175,14 +1473,10 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                     continue
                     
                 if rule_id in vpn_servers_to_add:
-                    LOGGER.debug("Adding new VPN server entity: %s", rule_id)
-                    self._entity_creation_queue.append({
-                        "rule_data": rule,
-                        "rule_type": "vpn_servers",
-                        "entity_class": None,  # Will be determined during creation
-                    })
+                    LOGGER.debug("Tracking new VPN server entity: %s", rule_id)
+                    self.known_unique_ids.add(rule_id)
             except Exception as err:
-                LOGGER.exception("Error processing VPN server for entity creation: %s", err)
+                LOGGER.exception("Error processing VPN server for entity tracking: %s", err)
 
     async def _discover_and_add_new_entities(self, new_data: Dict[str, List[Any]]) -> None:
         """Discover new rules from fetched data and dynamically add corresponding entities."""
@@ -1203,9 +1497,12 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
             UnifiQoSRuleSwitch,
             UnifiWlanSwitch,
             UnifiTrafficRouteKillSwitch,
+            UnifiLedToggleSwitch,
+            UnifiStaticRouteSwitch,
+            UnifiPortProfileSwitch,
+            UnifiNetworkSwitch,
             UnifiVPNClientSwitch,
-            UnifiVPNServerSwitch,
-            UnifiLedToggleSwitch
+            UnifiVPNServerSwitch
         )
 
         # Define mappings from rule types to entities
@@ -1214,9 +1511,12 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
             ("traffic_rules", UnifiTrafficRuleSwitch),
             ("firewall_policies", UnifiFirewallPolicySwitch),
             ("traffic_routes", UnifiTrafficRouteSwitch),
+            ("static_routes", UnifiStaticRouteSwitch),
             ("legacy_firewall_rules", UnifiLegacyFirewallRuleSwitch), 
             ("qos_rules", UnifiQoSRuleSwitch),
             ("wlans", UnifiWlanSwitch),
+            ("port_profiles", UnifiPortProfileSwitch),
+            ("networks", UnifiNetworkSwitch),
             ("vpn_clients", UnifiVPNClientSwitch),
             ("vpn_servers", UnifiVPNServerSwitch),
         ]
@@ -1236,29 +1536,49 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                         continue # Skip rules without ID
 
                     all_current_unique_ids.add(rule_id)
-                    # Only consider if not already known
+                    # Only consider if not already known and not already in Home Assistant registry
                     if rule_id not in self.known_unique_ids:
-                        potential_entities_data[rule_id] = {
-                            "rule_data": rule,
-                            "rule_type": rule_type_key, # Use the key
-                            "entity_class": entity_class,
-                        }
-                        LOGGER.debug("Coordinator: Discovered potential new entity: %s (%s)", rule_id, rule_type_key)
+                        # Check if entity already exists in Home Assistant registry
+                        from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
+                        entity_registry = async_get_entity_registry(self.hass)
+                        existing_entity_id = entity_registry.async_get_entity_id("switch", DOMAIN, rule_id)
+                        
+                        if existing_entity_id:
+                            # Entity exists in registry but not in our tracking - add to known_unique_ids
+                            LOGGER.debug("Coordinator: Found existing entity in registry: %s, adding to tracking", rule_id)
+                            self.known_unique_ids.add(rule_id)
+                        else:
+                            # Truly new entity - add to potential creation list
+                            potential_entities_data[rule_id] = {
+                                "rule_data": rule,
+                                "rule_type": rule_type_key, # Use the key
+                                "entity_class": entity_class,
+                            }
+                            LOGGER.debug("Coordinator: Discovered potential new entity: %s (%s)", rule_id, rule_type_key)
 
                     # Special handling for Traffic Routes Kill Switch
                     if rule_type_key == "traffic_routes" and hasattr(rule, 'raw') and "kill_switch_enabled" in rule.raw:
                         kill_switch_id = get_child_unique_id(rule_id, "kill_switch")
                         all_current_unique_ids.add(kill_switch_id)
                         if kill_switch_id not in self.known_unique_ids:
-                            # Use PARENT rule data for the kill switch
-                            potential_entities_data[kill_switch_id] = {
-                                "rule_data": rule, # Parent data
-                                "rule_type": rule_type_key, # Use the key
-                                "entity_class": UnifiTrafficRouteKillSwitch,
-                            }
-                            LOGGER.debug("Coordinator: Discovered potential new kill switch: %s (for parent %s)", kill_switch_id, rule_id)
+                            # Check if kill switch entity already exists in Home Assistant registry
+                            existing_kill_switch = entity_registry.async_get_entity_id("switch", DOMAIN, kill_switch_id)
+                            
+                            if existing_kill_switch:
+                                # Kill switch exists in registry but not in our tracking - add to known_unique_ids
+                                LOGGER.debug("Coordinator: Found existing kill switch in registry: %s, adding to tracking", kill_switch_id)
+                                self.known_unique_ids.add(kill_switch_id)
+                            else:
+                                # Use PARENT rule data for the kill switch
+                                potential_entities_data[kill_switch_id] = {
+                                    "rule_data": rule, # Parent data
+                                    "rule_type": rule_type_key, # Use the key
+                                    "entity_class": UnifiTrafficRouteKillSwitch,
+                                }
+                                LOGGER.debug("Coordinator: Discovered potential new kill switch: %s (for parent %s)", kill_switch_id, rule_id)
                 except Exception as err:
                     LOGGER.warning("Coordinator: Error processing rule during dynamic discovery: %s", err)
+
 
         # Special handling for LED-capable devices
         devices = new_data.get("devices", [])
@@ -1269,24 +1589,32 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
                     all_current_unique_ids.add(device_unique_id)
                     
                     if device_unique_id not in self.known_unique_ids:
-                        potential_entities_data[device_unique_id] = {
-                            "rule_data": device,
-                            "rule_type": "devices",
-                            "entity_class": UnifiLedToggleSwitch,
-                        }
-                        LOGGER.debug("Coordinator: Discovered potential new LED switch: %s", device_unique_id)
+                        # Check if LED switch entity already exists in Home Assistant registry  
+                        existing_led_switch = entity_registry.async_get_entity_id("switch", DOMAIN, device_unique_id)
+                        
+                        if existing_led_switch:
+                            # LED switch exists in registry but not in our tracking - add to known_unique_ids
+                            LOGGER.debug("Coordinator: Found existing LED switch in registry: %s, adding to tracking", device_unique_id)
+                            self.known_unique_ids.add(device_unique_id)
+                        else:
+                            potential_entities_data[device_unique_id] = {
+                                "rule_data": device,
+                                "rule_type": "devices",
+                                "entity_class": UnifiLedToggleSwitch,
+                            }
+                            LOGGER.debug("Coordinator: Discovered potential new LED switch: %s", device_unique_id)
                 except Exception as err:
                     LOGGER.warning("Coordinator: Error processing device during dynamic discovery: %s", err)
 
         # Find IDs that are known but no longer present in the current data (should be handled by deletion logic, but double-check)
         stale_known_ids = self.known_unique_ids - all_current_unique_ids
         if stale_known_ids:
-             LOGGER.debug("Coordinator: Found %d known IDs no longer present in current data.", len(stale_known_ids))
-             # Optionally, force remove them from known_unique_ids here if deletion logic is unreliable?
-             self.known_unique_ids -= stale_known_ids
-             for stale_id in stale_known_ids:
-                 LOGGER.info("Coordinator: Forcibly removing stale ID from tracking: %s", stale_id)
-                 self._remove_entity_async(stale_id)
+            LOGGER.debug("Coordinator: Found %d known IDs no longer present in current data.", len(stale_known_ids))
+            # Optionally, force remove them from known_unique_ids here if deletion logic is unreliable?
+            self.known_unique_ids -= stale_known_ids
+            for stale_id in stale_known_ids:
+                LOGGER.info("Coordinator: Forcibly removing stale ID from tracking: %s", stale_id)
+                self.hass.async_create_task(self._remove_entity_async(stale_id))
 
         # --- Create and Add New Entities ---
         entities_to_add = []
@@ -1301,8 +1629,8 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         for unique_id, data in potential_entities_data.items():
             # Double check it wasn't added in this run already (e.g. if discovered twice)
             if unique_id in self.known_unique_ids or unique_id in added_ids_this_run:
-                 LOGGER.warning("Coordinator: Skipping entity creation for %s as it's already known or added.", unique_id)
-                 continue
+                LOGGER.warning("Coordinator: Skipping entity creation for %s as it's already known or added.", unique_id)
+                continue
             try:
                 entity_class = data["entity_class"]
                 entity = entity_class(
@@ -1327,60 +1655,69 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
 
         # --- Establish Parent/Child Links for newly created entities ---
         if entity_map:
-             LOGGER.debug("Coordinator: Establishing parent/child links for %d newly created entities...", len(entity_map))
-             for unique_id, entity in entity_map.items():
-                 # If it's a kill switch, find its parent in the map or existing entities
-                 if isinstance(entity, UnifiTrafficRouteKillSwitch) and entity.linked_parent_id:
-                     parent_id = entity.linked_parent_id
-                     parent_entity = entity_map.get(parent_id)
-                     # If parent wasn't created in this run, look it up in hass.data
-                     if not parent_entity:
-                         parent_entity_id_in_hass = None
-                         registry = self.hass.helpers.entity_registry.async_get(self.hass)
-                         if registry:
-                              parent_entity_id_in_hass = registry.async_get_entity_id("switch", DOMAIN, parent_id)
-                         if parent_entity_id_in_hass:
-                              # We could either get entities from DOMAIN data, or use registry to get state to check the object
-                              # Use registry-based state since it's more reliable
-                              parent_entity_state = self.hass.states.get(parent_entity_id_in_hass)
-                              if parent_entity_state:
-                                  # For convenience, store the basic known information we have
-                                  LOGGER.debug("Found parent entity '%s' state for kill switch", parent_entity_id_in_hass)
-                                  entity.parent_entity_id = parent_entity_id_in_hass
-                                  # This is different from the parent_entity check below, which refers to newly created entities
-                                  LOGGER.debug("Coordinator: Linked new child %s to parent state %s", 
-                                             unique_id, parent_entity_id_in_hass)
-                              else:
-                                  LOGGER.warning("Coordinator: Could not find parent entity state %s for new kill switch %s", 
-                                               parent_id, unique_id)
+            LOGGER.debug("Coordinator: Establishing parent/child links for %d newly created entities...", len(entity_map))
+            for unique_id, entity in entity_map.items():
+                # If it's a kill switch, find its parent in the map or existing entities
+                if isinstance(entity, UnifiTrafficRouteKillSwitch) and entity.linked_parent_id:
+                    parent_id = entity.linked_parent_id
+                    parent_entity = entity_map.get(parent_id)
+                    # If parent wasn't created in this run, look it up in hass.data
+                    if not parent_entity:
+                        parent_entity_id_in_hass = None
+                        registry = self.hass.helpers.entity_registry.async_get(self.hass)
+                        if registry:
+                            parent_entity_id_in_hass = registry.async_get_entity_id("switch", DOMAIN, parent_id)
+                        if parent_entity_id_in_hass:
+                            # We could either get entities from DOMAIN data, or use registry to get state to check the object
+                            # Use registry-based state since it's more reliable
+                            parent_entity_state = self.hass.states.get(parent_entity_id_in_hass)
+                            if parent_entity_state:
+                                # For convenience, store the basic known information we have
+                                LOGGER.debug("Found parent entity '%s' state for kill switch", parent_entity_id_in_hass)
+                                entity.parent_entity_id = parent_entity_id_in_hass
+                                # This is different from the parent_entity check below, which refers to newly created entities
+                                LOGGER.debug("Coordinator: Linked new child %s to parent state %s", 
+                                           unique_id, parent_entity_id_in_hass)
+                            else:
+                                LOGGER.warning("Coordinator: Could not find parent entity state %s for new kill switch %s", 
+                                             parent_id, unique_id)
 
-                     if parent_entity and isinstance(parent_entity, UnifiTrafficRouteSwitch):
-                          parent_entity.register_child_entity(unique_id)
-                          entity.register_parent_entity(parent_id)
-                          LOGGER.debug("Coordinator: Linked new child %s to parent %s", unique_id, parent_id)
-                     else:
-                          LOGGER.warning("Coordinator: Could not find parent entity %s for new kill switch %s", parent_id, unique_id)
+                    if parent_entity and isinstance(parent_entity, UnifiTrafficRouteSwitch):
+                        parent_entity.register_child_entity(unique_id)
+                        entity.register_parent_entity(parent_id)
+                        LOGGER.debug("Coordinator: Linked new child %s to parent %s", unique_id, parent_id)
+                    else:
+                        LOGGER.warning("Coordinator: Could not find parent entity %s for new kill switch %s", parent_id, unique_id)
 
         # --- Add Entities to Home Assistant ---
         if entities_to_add:
             LOGGER.info("Coordinator: Dynamically adding %d new entities to Home Assistant.", len(entities_to_add))
             try:
-                self.async_add_entities_callback(entities_to_add)
+                # Check if callback is available and call it
+                if self.async_add_entities_callback:
+                    # At this point we know it's not None, call it with error handling
+                    try:
+                        self.async_add_entities_callback(entities_to_add)  # pylint: disable=not-callable
+                    except TypeError as te:
+                        LOGGER.error("Coordinator: async_add_entities_callback is not callable: %s", te)
+                        return
+                else:
+                    LOGGER.error("Coordinator: async_add_entities_callback is not set, cannot add entities")
                 # Update known IDs *after* successful addition
                 self.known_unique_ids.update(added_ids_this_run)
                 LOGGER.debug("Coordinator: Added %d new IDs to known_unique_ids (Total: %d)",
                              len(added_ids_this_run), len(self.known_unique_ids))
             except Exception as add_err:
-                 LOGGER.error("Coordinator: Failed to dynamically add entities: %s", add_err)
+                LOGGER.error("Coordinator: Failed to dynamically add entities: %s", add_err)
         else:
-             LOGGER.debug("Coordinator: No new entities to add dynamically in this cycle.")
+            LOGGER.debug("Coordinator: No new entities to add dynamically in this cycle.")
 
     async def _async_get_vpn_clients(self) -> List[VPNConfig]:
         """Get VPN clients from the API."""
         try:
             result = await self.api.get_vpn_clients()
             LOGGER.debug("Fetched %d VPN clients", len(result))
-            
+
             # Update the internal list
             self.vpn_clients = result
             return result
@@ -1394,7 +1731,7 @@ class UnifiRuleUpdateCoordinator(DataUpdateCoordinator):
         try:
             result = await self.api.get_vpn_servers()
             LOGGER.debug("Fetched %d VPN servers", len(result))
-            
+
             # Update the internal list
             self.vpn_servers = result
             return result
